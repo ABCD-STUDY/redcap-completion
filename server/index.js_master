@@ -1,0 +1,749 @@
+#!/usr/bin/env nodejs
+
+//
+// --timepoint baseline_year_1_arm_1
+// --timepoint 6_month_follow_up_arm_1
+// --timepoint 1_year_follow_up_y_arm_1
+//
+'use strict';
+
+const program = require('commander');
+var request = require('request');
+var fs = require('fs');
+var path = require('path');
+var peg = require('pegjs');
+var async = require("async");
+var parser = null;
+
+var participants = [];
+var datadictionary = [];
+var instruments = {};
+var instrumentLabels = {};
+var dataThisParticipant = [];
+var exportFileName = "";
+var timepoint = 'baseline_year_1_arm_1';
+var events = [];
+
+function getDataDictionary( tokens ) {
+    var token = "";
+    var sites = Object.keys(tokens);
+    for(var i = 0; i < sites.length; i++) {
+	var site = sites[i];
+	if (tokens[site] == "TEST")
+	    continue;
+	token = tokens[site];
+	break;
+    }
+
+    var data = {
+	'token': '<put your REDCap API key here>',
+	'content': 'metadata',
+	'format': 'json',
+	'returnFormat': 'json'
+    }
+    
+    var headers = {
+	'User-Agent':       'Super Agent/0.0.1',
+	'Content-Type':     'application/x-www-form-urlencoded'
+    }
+    
+    var url = "https://abcd-rc.ucsd.edu/redcap/api/";
+    request({
+	method: 'POST',
+	url: url,
+	form: data,
+	headers: headers,
+	json: true
+    }, function( error, response, body) {
+	if (error || response.statusCode !== 200) {
+	    // error case
+	    process.stdout.write("ERROR: could not get a response back from redcap " + error + " " + JSON.stringify(response) + "\n");
+	    return;
+	}
+	
+	datadictionary = body;
+	
+	// get list of instruments
+	instruments = {};
+	for (var entry in datadictionary) {
+	    if (datadictionary[entry]['field_type'] == 'descriptive')
+		continue;
+	    if (datadictionary[entry]['field_type'] == 'notes')
+		continue;
+	    // find out if we have a date attached to the HIDEFROMCOMPLETION field
+	    var matches = datadictionary[entry]['field_annotation'].match(/HIDEFROMCOMPLETION(\d{4})(\d{2})(\d{2})/);
+	    if (matches !== null) {
+		console.log(" HIDEFROMCOMPLETION FOUND WITH DATE! " + JSON.stringify(matches) + " for " + datadictionary[entry]['field_annotation'] + " " + JSON.stringify(datadictionary[entry]));
+	    } else { // we could still have a HIDEFROMCOMPLETION without a date here
+		if (datadictionary[entry]['field_annotation'].indexOf("HIDEFROMCOMPLETION") !== -1)
+	    	    continue;
+	    }
+	    if (datadictionary[entry]['field_name'] == "permission_school_records" || datadictionary[entry]['field_name'] == "permission_teacher_contact")
+		continue;
+	    // don't look at field with @HIDDEN annotation
+	    if (datadictionary[entry]['field_annotation'].indexOf("HIDDEN") !== -1)
+		continue;
+	    
+	    // if a variable is of type checkbox we have to replace it with the list of possible entries from the choices column
+	    // any one entry filled out would make this work
+	    var numChoices = [];
+	    if (datadictionary[entry]['field_type'] == 'checkbox') {
+		// find out how many choices there are
+		var choices = datadictionary[entry]['select_choices_or_calculations'].split("|");
+		for (var i = 0; i < choices.length; i++) {
+		    var c = choices[i].trim().split(",")[0].trim();
+		    numChoices.push(c);
+		}
+	    }
+	    if (typeof instruments[datadictionary[entry]['form_name']] == 'undefined')
+		instruments[datadictionary[entry]['form_name']] = [];
+	    instruments[datadictionary[entry]['form_name']].push([ datadictionary[entry]['field_name'],
+								   datadictionary[entry]['branching_logic'],
+								   numChoices,
+								   matches!==null?matches[1] + "-" + matches[2] + "-" + matches[3]:null
+								 ]);
+	}
+	getNamesForInstrument(tokens);
+	//process.stdout.write("Done with getting data dictionary...\n" + JSON.stringify(instruments));
+    });    
+}
+
+function getNamesForInstrument( tokens ) {
+    instrumentLabels = {};
+
+    var data = {
+	'token': '<put your REDCap API key here>',
+	'content': 'instrument',
+	'format': 'json',
+	'returnFormat': 'json'
+    }
+    
+    var headers = {
+	'User-Agent':       'Super Agent/0.0.1',
+	'Content-Type':     'application/x-www-form-urlencoded'
+    }
+    
+    var url = "https://abcd-rc.ucsd.edu/redcap/api/";
+    request({
+	method: 'POST',
+	url: url,
+	form: data,
+	headers: headers,
+	json: true
+    }, function( error, response, body) {
+	if (error || response.statusCode !== 200) {
+	    // error case
+	    process.stdout.write("ERROR: could not get a response back from redcap " + error + " " + JSON.stringify(response) + "\n");
+	    return;
+	}
+	data = body;
+	for (var entry in data) {
+	    instrumentLabels[data[entry]['instrument_name']] = data[entry]['instrument_label'];	    
+	}
+	console.log("found " + Object.keys(instrumentLabels).length + " instruments");
+	filterDataDictionary( tokens ); // remove entries from instruments again that are not part of the baseline event
+    });
+}
+
+function filterDataDictionary( tokens ) {
+    var token = "";
+    var sites = Object.keys(tokens);
+    for(var i = 0; i < sites.length; i++) {
+	var site = sites[i];
+	if (tokens[site] == "TEST")
+	    continue;
+	token = tokens[site];
+	break;
+    }
+
+    var data = {
+	'token': '<put your REDCap API key here>',
+	'content': 'formEventMapping',
+	'format': 'json',
+	'returnFormat': 'json'
+    }
+    
+    var headers = {
+	'User-Agent':       'Super Agent/0.0.1',
+	'Content-Type':     'application/x-www-form-urlencoded'
+    }
+    
+    var url = "https://abcd-rc.ucsd.edu/redcap/api/";
+    request({
+	method: 'POST',
+	url: url,
+	form: data,
+	headers: headers,
+	json: true
+    }, function( error, response, body) {
+	if (error || response.statusCode !== 200) {
+	    // error case
+	    process.stdout.write("ERROR: could not get a response back from redcap " + error + " " + JSON.stringify(response) + "\n");
+	    return;
+	}
+	data = body;
+	console.log("number of instruments before filering: " + Object.keys(instruments).length);
+	
+	// filter out instruments that are not in the baseline event
+	var okforms = [];
+	for(var d in data) {
+	    console.log("Check event name: " + data[d]['unique_event_name'] + " for: " + data[d]['form']);
+	    if (data[d]['unique_event_name'] == timepoint /*'baseline_year_1_arm_1' */) {
+		okforms.push(data[d]['form']);
+	    }
+	}
+	console.log("instruments to keep are: " + okforms.length + "\n" + JSON.stringify(okforms));
+
+	for (var d in instruments) {
+	    if (okforms.indexOf(d) === -1) {
+		console.log("remove the form: " + d);
+		delete instruments[d];
+	    } else {
+		console.log("Keep form: " + d);
+	    }
+	}
+	console.log("number of instruments left: " + Object.keys(instruments).length);
+	// get the events from REDCap as well (timing)
+	getEvents( tokens );	
+    });
+}
+
+function getEvents( tokens ) {
+    var token = "";
+    var sites = Object.keys(tokens);
+    for(var i = 0; i < sites.length; i++) {
+	var site = sites[i];
+	if (tokens[site] == "TEST")
+	    continue;
+	token = tokens[site];
+	break;
+    }
+
+    var data = {
+	'token': '<put your REDCap API key here>',
+	'content': 'event',
+	'format': 'json',
+	'returnFormat': 'json'
+    }
+    
+    var headers = {
+	'User-Agent':       'Super Agent/0.0.1',
+	'Content-Type':     'application/x-www-form-urlencoded'
+    }
+    
+    var url = "https://abcd-rc.ucsd.edu/redcap/api/";
+    request({
+	method: 'POST',
+	url: url,
+	form: data,
+	headers: headers,
+	json: true
+    }, function( error, response, body) {
+	if (error || response.statusCode !== 200) {
+	    // error case
+	    process.stdout.write("ERROR: could not get a response back from redcap " + error + " " + JSON.stringify(response) + "\n");
+	    return;
+	}
+	events = body;
+    });
+}
+
+function getParticipants( tokens ) {
+
+    participants = [];
+    var queue = async.queue(function(site, callback) {
+	var token = tokens[site];
+	var data = {
+	    'token': token,
+	    'content': 'record',
+	    'format' : 'json',
+	    'type' : 'flat',
+	    'rawOrLabel' : 'raw',
+            'fields[0]': 'enroll_total',
+	    'fields[1]': 'id_redcap',
+	    'fields[2]': 'redcap_event_name',
+	    'fields[3]': 'asnt_timestamp',
+	    'fields[4]': 'pilot_subject',
+            'events[0]': 'baseline_year_1_arm_1',
+	    'rawOrLabelHeaders' : 'raw',
+	    'exportCheckboxLabel' : 'false',
+	    'exportSurveyFields' : 'false',
+	    'exportDataAccessGroups': 'false',
+	    'returnFormat': 'json'
+	};
+
+	var headers = {
+	    'User-Agent':       'Super Agent/0.0.1',
+	    'Content-Type':     'application/x-www-form-urlencoded'
+	}
+	
+	var url = "https://abcd-rc.ucsd.edu/redcap/api/";
+	request({
+	    method: 'POST',
+	    url: url,
+	    form: data,
+	    headers: headers,
+	    json: true
+	}, function( error, response, body) {
+	    if (error || response.statusCode !== 200) {
+		// error case
+		process.stdout.write("ERROR: could not get a response back from redcap " + error + " " + JSON.stringify(response) + "\n");
+		return;
+	    }
+	    
+	    // now do something with this information
+	    // process.stdout.write(JSON.stringify(body));
+	    for (var i = 0; i < body.length; i++) {
+		var entry = body[i];
+		
+		if (entry['enroll_total___1'] == "1") {
+		    entry['redcap_data_access_group'] = site;
+		    participants.push(entry);
+		}
+	    }
+	    
+	    callback();
+	});	
+	
+    }, 1); // Run one simultaneous uploads
+
+    queue.drain = function() {	
+	process.stdout.write("finished getting participants from redcap\n");
+	findProblems( tokens );
+    };
+
+    // Queue your files for upload
+    var sites = Object.keys(tokens);
+    for (var i = 0; i < sites.length; i++) {
+	var site = sites[i];
+	if (site == "TEST") {
+	    continue;
+	}
+	if (site == "OAHU") {
+	    continue;
+	}
+	if (site == "MSSM") {
+	    continue;
+	}
+	//console.log("SITE: " + site + " pull data with token: " + tokens[site]);
+	queue.push(site, (function(site) {
+	    return function(err) {
+		process.stdout.write("finished getting data for site: " + site + " num participants is:" + participants.length + "\n");
+	    };
+	})(site));
+    }
+
+}
+
+function getBestDate( timepoint, participant ) {
+    // look in the list of participants for the asnt_timepoint for the baseline visit
+    var found = false;
+    var asnt_date = '';
+    for (var i = 0; i < participants.length; i++) {
+	if ( participants[i]['id_redcap'] == participant ) {
+	    found = true;
+	    asnt_date = participants[i]['asnt_timestamp'];
+	    break;
+	}
+    }
+    if (!found || typeof asnt_date === 'undefined') { // failed calculating the date
+	console.log("did not find the assent date");
+	return '';
+    }
+
+    // look for the events to find out the spacing for the timepoint
+    if (events.length == 0) {
+	console.log("Error: expected list of events found nothing");
+	return;
+    }
+
+    for (var i = 0; i < events.length; i++) {
+	if (events[i]['unique_event_name'] == timepoint ) {
+	    var tD = asnt_date.match(/(\d{4})-(\d{2})-(\d{2})/);
+	    var d0 = new Date(parseInt(tD[1]), parseInt(tD[2])-1, parseInt(tD[3]));
+	    d0.setDate(d0.getDate() + parseInt(events[i]['day_offset']));
+	    return d0.toISOString().substring(0,10);
+	}
+    }
+    return '';
+}
+
+function getParticipantData( participants, tokens, callback ) {
+    var chunkSize = 100;
+    var thisChunk = [];
+    if (participants.length <= chunkSize) {
+	thisChunk = participants;
+	participants = [];
+    } else {
+	thisChunk = participants.slice(0, chunkSize);
+	participants = participants.slice(chunkSize);
+    }
+    process.stdout.write("Start call to get " + thisChunk.length + " of " + participants.length + " participants data...\n");
+
+
+    var data = {
+	'token': '<put your REDCap API key here>',
+	'content': 'record',
+	'format': 'json',
+	'type': 'flat',
+	'events[0]': timepoint /*'baseline_year_1_arm_1'*/,
+	'rawOrLabel': 'raw',
+	'rawOrLabelHeaders': 'raw',
+	'exportCheckboxLabel': 'false',
+	'exportSurveyFields': 'false',
+	'exportDataAccessGroups': 'true',
+	'returnFormat': 'json'
+    }
+
+    if (thisChunk.length == 0) {
+	process.stdout.write("Error, this chunk is empty, don't call REDCap");
+    }
+    for (var i = 0; i < thisChunk.length; i++) {
+	data['records[' + i + ']'] = thisChunk[i];
+    }
+
+    var headers = {
+	'User-Agent':       'Super Agent/0.0.1',
+	'Content-Type':     'application/x-www-form-urlencoded'
+    }
+
+    var url = "https://abcd-rc.ucsd.edu/redcap/api/";
+    request({
+	method: 'POST',
+	url: url,
+	form: data,
+	headers: headers,
+	json: true
+    }, function( error, response, body) {
+	if (error || response.statusCode !== 200) {
+	    // error case
+	    process.stdout.write("ERROR: could not get a response back from redcap " + error + " " + JSON.stringify(response) + "\n");
+	    return;
+	}
+	//process.stdout.write("got this response:" + JSON.stringify(body) + "\n" + " for this data:" + JSON.stringify(data));
+
+	data = body;
+
+	for (var p in data) {
+     	    (callback)(data[p]); // call the callback to process the data in this chunk
+	}
+	if (participants.length > 0) {
+  	    getParticipantData( participants, tokens, callback ); // call the next round of results
+	} else {
+	    //process.stdout.write("DONE with querying data for participants...\n\n" + JSON.stringify(results) + "\n\n");
+	    fs.writeFile(exportFileName, JSON.stringify(results), function(err) {
+		if (err) {
+		    return console.log(err);
+		}
+		console.log("wrote data to " + exportFileName);
+	    });
+	    // sortSiteData( "date" );
+	}
+    });
+}
+
+function resolveVariable( vari ) {
+    if (dataThisParticipant.length == 0) {
+	console.log("Error: No data from REDCap");
+	return;
+    }
+    if (vari[1] != null) {
+	if (typeof dataThisParticipant[vari[0] + "___" + vari[1]] == 'undefined') {
+	    //console.log("ERROR: cannot find the variable \""+ vari[0] + "___" + vari[1] + "\"");
+	    return;
+	}
+	
+	return dataThisParticipant[vari[0] + "___" + vari[1]];
+    }
+    return dataThisParticipant[vari[0]];
+}
+
+
+// global functions supported by REDCap's branching logic
+var functions = {
+    mean : function(n) {
+	var m = 0;
+	var c = 0;
+	for(i in n) {
+	    if (n[i] != "") { // only add values that have a non-string zero value
+		m = m + n[i];
+		c = c + 1;
+	    }
+	}
+	if ( c > 0) {
+	    m = m / c;
+	} else {
+	    m = ""; // nothing
+	}
+	return m;
+    },
+    sum : function(n) {
+	var m = 0;
+	var c = 0;
+	for(i in n) {
+	    if (n[i] != "") { // only add values that have a non-string zero value
+		m = m + n[i];
+		c = c + 1;
+	    }
+	}
+	if ( c == 0) {
+	    m = ""; // nothing
+	}
+	return m;
+    }
+};
+
+var results = [];
+function findProblems( tokens ) {
+    // lets ask for one participants data for one instrument and show what that looks like
+    // for example use the 'baseline_visits' instrument
+    if (parser === null) {
+	process.stdout.write("Error: parser did not build");
+	return;
+    }
+
+    // get the data for all participants first
+    var allparts = participants.reduce(function( acc, val ) { acc.push(val['id_redcap']); return acc; }, []);
+
+    getParticipantData( allparts, tokens, function( data ) {
+	dataThisParticipant = data;
+	var participant = data['id_redcap'];
+	var site = data['redcap_data_access_group'].split("_")[0];
+	var date = data['asnt_timestamp'];
+	if (timepoint == "6_month_follow_up_arm_1") { // for this one event we cannot use asnt_timestamp
+	    date = data['fu_6mo_completion_time'];
+	}
+	// if we have the asnt_timestamp of the baseline we could calculate what the best date could be
+	var alternate_date = getBestDate( timepoint, participant );
+	//console.log("calculated alternate Date is: " + alternate_date + " for pGUID: " + participant);
+	
+	//console.log('got all data for ' + "NDAR_INV0PRHUTZA");
+	var errors = []; // store variables that produced an error - if they don't exist for example 
+	
+	// use the parser to evaluate the
+	var str = "";
+	var countGood = 0;
+	var countAll = 0;
+        var parti = { 'instruments': [] };
+	for (var i in instruments) {
+	    var instrument = instruments[i];
+	    var complete = true;
+	    var reason = "is complete"; // why this is not complete
+	    for (var e in instrument) {
+		if (!complete)
+		    break;
+		var visible = true;
+		var entry = instrument[e];
+		// we have skip tests if the date for this assessment was before the date indicated in the HIDEFROMCOMPLETION field
+		if (entry[3] !== null) {
+		    // we have a HIDEFROMCOMPLETION date field
+		    var thresholdDate = ""; // a Date object
+		    var tD = entry[3].match(/(\d{4})-(\d{2})-(\d{2})/);
+		    if (tD !== null) {
+			thresholdDate = new Date(tD[1], tD[2]-1, tD[3]); // month starts with 0
+		    }
+		    // what is the assessment date for this participant?
+		    //console.log(" HIDEFROMCOMPLETION DATE CHECK. thresholdDate: " + entry[3] + " -> " + thresholdDate.toISOString() + " -> assentDate " + date);
+		    if (date !== "") {
+			// parse: 2017-05-20 10:31
+			var matches = date.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/);
+			//console.log(" split date into: " + JSON.stringify(matches));
+			if (matches !== null) {
+			    var assentDate = new Date(matches[1], matches[2]-1, matches[3]);
+			    var datediff = parseInt((assentDate - thresholdDate)/1000); // difference in seconds
+			    if (datediff < 0) {
+				//console.log("  HIDEFROMCOMPLETION: date difference is negative, date is before the threshold and should not count again completion: " + datediff + " participant: " + participant + " " + site + " " + date + " " + JSON.stringify(entry));
+				// lets ignore this entry - does not count against the site
+				//console.log("   IGNORE");
+				continue;
+			    }
+			}
+		    }
+		}
+		
+		if (entry[1] == "") { // don't need to do something if branching logic is empty, always visible, always check if a value exists
+
+		    // now in this case we could have a checkbox, any value in any field of the checkbox would count as ok
+		    if (entry[2].length > 0) {
+			// now check if any of these variables has a value
+			var foundOne = false;
+			for(var j = 0; j < entry[2].length; j++) {
+			    var vname = entry[0] + "___" + entry[2][j];
+			    if (typeof data[vname] == 'undefined') {
+				errors.push(vname);
+				continue;
+			    }
+			    if (data[vname] != "") {
+				foundOne = true;
+				break;
+			    }
+			}
+			if (!foundOne) {
+			    complete = false;
+			    reason = " has " + entry[0] + " as an empty entry";
+			    continue;
+			}
+		    } else {		    
+			if (typeof data[entry[0]] == 'undefined') {
+			    //console.log("Error: tried to pull value for non-existent variable " + entry[0] + ", your REDCap stinks");
+			    errors.push(entry[0]);
+			    continue;
+			}
+			if (data[entry[0]] == "") {
+			    complete = false;
+			    reason = " has " + entry[0] + " as an empty entry";
+			}
+			continue;
+		    }
+		} else {  // now we have some entries that do have branching logic
+		    try {
+   			visible = parser.parse( entry[1].trim() );
+		    } catch(err) {
+			console.log("ERROR in evaluation of: " + entry[1].trim() + "error message: " + err);
+		    }
+		
+		    if (!visible) {
+			continue; // all is well, lets try another one
+		    }
+		}
+		
+		// if the value is still visible we it to have a value
+		if (entry[2].length > 0) { // any of the entries could have a value and we are ok
+		    var foundOne = false;
+		    for (var j = 0; j < entry[2].length; j++) {
+			var vname = entry[0] + "___" + entry[2][j];
+			if (typeof data[vname] == 'undefined') {
+			    errors.push(vname);
+			    continue;
+			}
+			if (data[vname] != "") {
+			    foundOne = true;
+			    break;
+			}
+		    }
+		    if (!foundOne) {
+			complete = false;
+			reason = " has " + entry[0] + " as an empty entry";
+			continue;
+		    }
+		} else {
+		    if (typeof data[entry[0]] == 'undefined') {
+			//console.log("Error: tried to pull value for non-existent variable " + entry[0] + ", your REDCap stinks");
+			errors.push(entry[0]);
+			continue;
+		    }
+		}
+		//console.log("instrument is:"+ JSON.stringify(entry));		    
+	    }
+	    //console.log("instrument " + i + " is " + (complete?"complete":"not complete") + " for this participant");
+	    var instrumentLabel = instrumentLabels[i];
+	    parti['instruments'].push({ 'complete': complete, 'instrument': i, 'instrumentLabel': instrumentLabel, 'reason': reason });
+	    //str = str + "<div class=\"box " + (complete?"complete":"ncomplete") + "\" title=\""+ participant +"\" data-toggle=\"popover\" data-trigger=\"focus\" instrument=\"" + i + "\" data-content=\"The instrument <i>" + instrumentLabel + "</i> for site " + site.toUpperCase() + " " + reason + ".\" data-container=\"body\"></div>";
+	    // only count towards completenes if the instrument starts with Y_ or P_
+	    if (instrumentLabel.startsWith("Y_") || instrumentLabel.startsWith("P_")) {
+		if ( complete ) {
+  		    countGood = countGood + 1;
+		}
+		countAll = countAll + 1;
+	    }
+	}
+	// lets create a div for a site
+/*	if (jQuery('#completeness .' + site).length == 0) {
+	    var str2 = "";
+	    for(i in instruments) {
+		instrument = instruments[i];
+		var instrumentLabel = instrumentLabels[i];
+		var classStr = "boxUnMarked complete";
+		var titleStr = "does not count";
+		if (instrumentLabel.startsWith("Y_") || instrumentLabel.startsWith("P_")) {
+		    classStr = "boxMarked complete";
+		    titleStr = "counts";
+		}
+		str2 = str2 + "<div class=\"" + classStr + "\" instrument=\"" + i + "\" title=\""+instrumentLabel+" "+titleStr + " towards your completeness score" + "\"></div>";
+		
+	    }
+	    jQuery('#completeness').append("<div class=\"site-name " + site + "\"><div class=\"site-name\">" + site.toUpperCase() + " (<span class=\""+ site + "-completeness\" n=\"0\" oldavg=\"0\"></span>)</div><div class=\"instrument-markers\">"+str2+"</div></div>");
+	} */
+	var siteScore = ((countAll > 0)?(countGood/countAll * 100.0).toFixed(0):"NA");
+	parti['siteScore'] = siteScore;
+	parti['site'] = site;
+	parti['date'] = date;
+	parti['alternate_date'] = alternate_date;
+	parti['participant'] = participant;
+	results.push(parti);
+	/*jQuery('#completeness .' + site).append("<div class=\"part-row\" site=\"" + site + "\" date=\""+date+"\">" + str + "<div class=\"tiny-name\">" + participant + " " + date + " " + siteScore + "&#37;</div></div>");
+	// update the sites completeness score
+	if (siteScore != "NA") {
+	    var n = parseInt(jQuery("span."+site + "-completeness").attr('n')) + 1;
+	    var oldavg = parseFloat(jQuery("span."+site + "-completeness").attr('oldavg'));
+	    var newavg = oldavg + ((countGood/countAll * 100.0) - oldavg)/n;
+	    jQuery("span."+site + "-completeness").attr('n', n);
+	    jQuery("span."+site + "-completeness").attr('oldavg', newavg);
+	    jQuery("span."+site + "-completeness").html(newavg.toFixed(0) + "&#37;");
+	}
+
+	var popOverSettings = {
+	    placement: 'bottom',
+	    container: 'body',
+	    html: true,
+	    selector: '[data-toggle="popover"]', //Sepcify the selector here
+	    content: function () {
+		return $('#popover-content').html();
+	    }
+	}
+	jQuery('body').popover(popOverSettings); */
+
+	//if (errors.length > 0)
+	//    console.log("Error: tried to pull value for non-existent variables: " + errors.join(","));
+    });
+}
+
+let run = (file, options) => {
+    let params = [];
+    timepoint = 'baseline_year_1_arm_1';
+    if (options.option)
+	params.push('o');
+    if (options.input)
+	params.push('i');
+    if (options.timepoint) {
+	params.push('t');
+	timepoint = options.timepoint;
+    } 
+
+    if (file == "" || typeof file === 'undefined') {
+	console.log("Error: please provide a filename");
+	return;
+    }
+    exportFileName = file;
+    
+    // here we do our work
+    //process.stdout.write("hi with these options " + params.join(',') + " - > on " + file + "\n");
+
+    // create the parser
+    var grammar = fs.readFileSync(path.resolve(__dirname, 'grammar.pegjs')).toString();
+    var parserSource = peg.generate(grammar, {
+	cache:    true, // $("#option-cache").is(":checked"),
+	optimize: 'speed', // $("#option-optimize").val(),
+	output:   "source"
+    });
+    parser = eval(parserSource);
+    // ok parser exists now
+
+    // get tokens options
+    var tokens = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../../code/php/tokens.json'), 'utf8'));
+    getDataDictionary(tokens);
+    getParticipants(tokens);
+}
+
+program
+    .version('0.0.1')
+    .command('create [file]')
+    .option('-o, --option','option description')
+    .option('-i, --input [optional]','optional user input')
+    .option('-t, --timepoint [baseline_year_1_arm_1]', 'redcap event name')
+    .action(run);
+
+program.parse(process.argv); // end with parse to parse through the input
+
+if (program.args.length === 0)
+    program.help();

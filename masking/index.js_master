@@ -1,0 +1,668 @@
+#!/usr/bin/env nodejs
+//  call: nodejs --max_old_space_size=6096 ./index.js create dataMask.json
+
+'use strict';
+
+const program = require('commander');
+var request = require('request');
+var fs = require('fs');
+var path = require('path');
+var peg = require('pegjs');
+var async = require("async");
+var parser = null;
+
+var participants = [];
+var datadictionary = [];
+var instruments = {};
+var instrumentLabels = {};
+var dataThisParticipant = [];
+var exportFileName = "";
+
+function getDataDictionary(tokens) {
+	var token = "";
+	var sites = Object.keys(tokens);
+	for (var i = 0; i < sites.length; i++) {
+		var site = sites[i];
+		if (tokens[site] == "TEST")
+			continue;
+		token = tokens[site];
+		break;
+	}
+
+	var data = {
+		'token': '203916E7BD6A3AC814BAD05109FDA87D',
+		'content': 'metadata',
+		'format': 'json',
+		'returnFormat': 'json'
+	}
+
+	var headers = {
+		'User-Agent': 'Super Agent/0.0.1',
+		'Content-Type': 'application/x-www-form-urlencoded'
+	}
+
+	var url = "https://abcd-rc.ucsd.edu/redcap/api/";
+	request({
+		method: 'POST',
+		url: url,
+		form: data,
+		headers: headers,
+		json: true
+	}, function (error, response, body) {
+		if (error || response.statusCode !== 200) {
+			// error case
+			process.stdout.write("ERROR: could not get a response back from redcap " + error + " " + JSON.stringify(response) + "\n");
+			return;
+		}
+
+		datadictionary = body;
+
+		// get list of instruments
+		instruments = {};
+		for (var entry in datadictionary) {
+			if (datadictionary[entry]['field_type'] == 'descriptive')
+				continue;
+			if (datadictionary[entry]['field_type'] == 'notes')
+				continue;
+			if (datadictionary[entry]['field_annotation'].indexOf("HIDEFROMCOMPLETION") !== -1)
+				continue;
+			if (datadictionary[entry]['field_name'] == "permission_school_records" || datadictionary[entry]['field_name'] == "permission_teacher_contact")
+				continue;
+			// if a variable is of type checkbox we have to replace it with the list of possible entries from the choices column
+			// any one entry filled out would make this work
+			var numChoices = [];
+			if (datadictionary[entry]['field_type'] == 'checkbox') {
+				// find out how many choices there are
+				var choices = datadictionary[entry]['select_choices_or_calculations'].split("|");
+				for (var i = 0; i < choices.length; i++) {
+					var c = choices[i].trim().split(",")[0].trim();
+					numChoices.push(c);
+				}
+			}
+			if (typeof instruments[datadictionary[entry]['form_name']] == 'undefined')
+				instruments[datadictionary[entry]['form_name']] = [];
+			instruments[datadictionary[entry]['form_name']].push([datadictionary[entry]['field_name'],
+			datadictionary[entry]['branching_logic'],
+				numChoices]);
+		}
+		getNamesForInstrument(tokens);
+		//process.stdout.write("Done with getting data dictionary...\n" + JSON.stringify(instruments));
+	});
+}
+
+function getNamesForInstrument(tokens) {
+	instrumentLabels = {};
+
+	var data = {
+		'token': '<put your REDCap API token here>',
+		'content': 'instrument',
+		'format': 'json',
+		'returnFormat': 'json'
+	}
+
+	var headers = {
+		'User-Agent': 'Super Agent/0.0.1',
+		'Content-Type': 'application/x-www-form-urlencoded'
+	}
+
+	var url = "https://abcd-rc.ucsd.edu/redcap/api/";
+	request({
+		method: 'POST',
+		url: url,
+		form: data,
+		headers: headers,
+		json: true
+	}, function (error, response, body) {
+		if (error || response.statusCode !== 200) {
+			// error case
+			process.stdout.write("ERROR: could not get a response back from redcap " + error + " " + JSON.stringify(response) + "\n");
+			return;
+		}
+		data = body;
+		for (var entry in data) {
+			instrumentLabels[data[entry]['instrument_name']] = data[entry]['instrument_label'];
+		}
+		console.log("found " + Object.keys(instrumentLabels).length + " instruments");
+		filterDataDictionary(tokens); // remove entries from instruments again that are not part of the baseline event
+	});
+}
+
+function filterDataDictionary(tokens) {
+	var token = "";
+	var sites = Object.keys(tokens);
+	for (var i = 0; i < sites.length; i++) {
+		var site = sites[i];
+		if (tokens[site] == "TEST")
+			continue;
+		token = tokens[site];
+		break;
+	}
+
+	var data = {
+		'token': '<put your REDCap API token here>',
+		'content': 'formEventMapping',
+		'format': 'json',
+		'returnFormat': 'json'
+	}
+
+	var headers = {
+		'User-Agent': 'Super Agent/0.0.1',
+		'Content-Type': 'application/x-www-form-urlencoded'
+	}
+
+	var url = "https://abcd-rc.ucsd.edu/redcap/api/";
+	request({
+		method: 'POST',
+		url: url,
+		form: data,
+		headers: headers,
+		json: true
+	}, function (error, response, body) {
+		if (error || response.statusCode !== 200) {
+			// error case
+			process.stdout.write("ERROR: could not get a response back from redcap " + error + " " + JSON.stringify(response) + "\n");
+			return;
+		}
+		data = body;
+		console.log("number of instruments before filering: " + Object.keys(instruments).length);
+
+		// filter out instruments that are not in the baseline event
+		var okforms = [];
+		for (var d in data) {
+			console.log("Check event name: " + data[d]['unique_event_name'] + " for: " + data[d]['form']);
+			if (data[d]['unique_event_name'] == 'baseline_year_1_arm_1') {
+				okforms.push(data[d]['form']);
+			}
+		}
+		console.log("instruments to keep are: " + okforms.length + "\n" + JSON.stringify(okforms));
+
+		for (var d in instruments) {
+			if (okforms.indexOf(d) === -1) {
+				console.log("remove the form: " + d);
+				delete instruments[d];
+			} else {
+				console.log("Keep form: " + d);
+			}
+		}
+		console.log("number of instruments left: " + Object.keys(instruments).length);
+	});
+}
+
+function getParticipants(tokens) {
+
+	participants = [];
+	var queue = async.queue(function (token, callback) {
+		var data = {
+			'token': token,
+			'content': 'record',
+			'format': 'json',
+			'type': 'flat',
+			'rawOrLabel': 'raw',
+			'fields[0]': 'enroll_total',
+			'fields[1]': 'id_redcap',
+			'fields[2]': 'redcap_event_name',
+			'fields[3]': 'asnt_timestamp',
+			'fields[4]': 'pilot_subject',
+			'events[0]': 'baseline_year_1_arm_1',
+			'rawOrLabelHeaders': 'raw',
+			'exportCheckboxLabel': 'false',
+			'exportSurveyFields': 'false',
+			'exportDataAccessGroups': 'false',
+			'returnFormat': 'json'
+		};
+
+		var headers = {
+			'User-Agent': 'Super Agent/0.0.1',
+			'Content-Type': 'application/x-www-form-urlencoded'
+		}
+
+		var url = "https://abcd-rc.ucsd.edu/redcap/api/";
+		request({
+			method: 'POST',
+			url: url,
+			form: data,
+			headers: headers,
+			json: true
+		}, function (error, response, body) {
+			if (error || response.statusCode !== 200) {
+				// error case
+				process.stdout.write("ERROR: could not get a response back from redcap " + error + " " + JSON.stringify(response) + "\n");
+				return;
+			}
+
+			// now do something with this information
+			// process.stdout.write(JSON.stringify(body));
+			for (var i = 0; i < body.length; i++) {
+				var entry = body[i];
+				if (entry['enroll_total___1'] == "1") {
+					entry['redcap_data_access_group'] = site;
+					participants.push(entry);
+				}
+			}
+
+			callback();
+		});
+
+	}, 1); // Run one simultaneous uploads
+
+	queue.drain = function () {
+		process.stdout.write("finished getting participants from redcap\n");
+		findProblems(tokens);
+	};
+
+	// Queue your files for upload
+	var sites = Object.keys(tokens);
+	for (var i = 0; i < sites.length; i++) {
+		var site = sites[i];
+		if (site == "TEST") {
+			continue;
+		}
+		if (site == "OAHU") {
+			continue;
+		}
+		queue.push(tokens[site], (function (site) {
+			return function (err) {
+				console.log("finished getting data for site: " + site + " num participants is:" + participants.length);
+			};
+		})(site));
+	}
+
+}
+
+function convertResults2Csv(results) {
+	var str = "";
+	var header = {};
+	for (var i = 0; i < results.length; i++) {
+		var instruments = Object.keys(results[i]['instruments']);
+		for (var j = 0; j < instruments.length; j++) {
+			var items = Object.keys(results[i]['instruments'][instruments[j]]);
+			for (var k = 0; k < items.length; k++) {
+				header[items[k]] = "";
+			}
+		}
+	}
+	header = Object.keys(header);
+	str = str + "id_redcap,redcap_event_name," + header.join(",") + "\n";
+
+	// now create the rows
+	for (var i = 0; i < results.length; i++) {
+		var line = "" + results[i]['participant'] + ",baseline_year_1_arm_1,";
+		// flatten the list for all instruments
+		var instNames = Object.keys(results[i]['instruments']);
+		instNames.unshift({});
+		var flatten = instNames.reduce(function (acc, val) {
+			var item = Object.keys(results[i]['instruments'][val]);
+			for (var a = 0; a < item.length; a++) {
+				acc[item[a]] = results[i]['instruments'][val][item[a]];
+			}
+			return acc;
+		});
+		for (var j = 0; j < header.length; j++) {
+			var entry = flatten[header[j]];
+			if (entry === undefined) {
+				entry = "";
+			}
+			line = line + entry;
+			if (j < header.length - 1)
+				line = line + ",";
+
+		}
+		str = str + line + "\n";
+	}
+
+	return str;
+}
+
+function getParticipantData(participants, tokens, callback) {
+	var chunkSize = 100;
+	var thisChunk = [];
+	if (participants.length <= chunkSize) {
+		thisChunk = participants;
+		participants = [];
+	} else {
+		thisChunk = participants.slice(0, chunkSize);
+		participants = participants.slice(chunkSize);
+	}
+	process.stdout.write("Start call to get " + thisChunk.length + " of " + participants.length + " participants data...\n");
+
+
+	var data = {
+		'token': '<put your REDCap API token here>',
+		'content': 'record',
+		'format': 'json',
+		'type': 'flat',
+		'events[0]': 'baseline_year_1_arm_1',
+		'rawOrLabel': 'raw',
+		'rawOrLabelHeaders': 'raw',
+		'exportCheckboxLabel': 'false',
+		'exportSurveyFields': 'false',
+		'exportDataAccessGroups': 'true',
+		'returnFormat': 'json'
+	}
+
+	if (thisChunk.length == 0) {
+		process.stdout.write("Error, this chunk is empty, don't call REDCap");
+	}
+	for (var i = 0; i < thisChunk.length; i++) {
+		data['records[' + i + ']'] = thisChunk[i];
+	}
+
+	var headers = {
+		'User-Agent': 'Super Agent/0.0.1',
+		'Content-Type': 'application/x-www-form-urlencoded'
+	}
+
+	var url = "https://abcd-rc.ucsd.edu/redcap/api/";
+	request({
+		method: 'POST',
+		url: url,
+		form: data,
+		headers: headers,
+		json: true
+	}, function (error, response, body) {
+		if (error || response.statusCode !== 200) {
+			// error case
+			process.stdout.write("ERROR: could not get a response back from redcap " + error + " " + JSON.stringify(response) + "\n");
+			return;
+		}
+		//process.stdout.write("got this response:" + JSON.stringify(body) + "\n" + " for this data:" + JSON.stringify(data));
+
+		data = body;
+
+		for (var p in data) {
+			(callback)(data[p]); // call the callback to process the data in this chunk
+		}
+		if (participants.length > 0) {
+			getParticipantData(participants, tokens, callback); // call the next round of results
+		} else {
+			var table = convertResults2Csv(results);
+			fs.writeFile(exportFileName + ".csv", table, function (err) {
+				if (err) {
+					return console.log(err);
+				}
+				console.log("wrote data to " + exportFileName + ".csv");
+			});
+
+			// add the dictionary to the results object
+			results.unshift(scoreDict);
+
+			//process.stdout.write("DONE with querying data for participants...\n\n" + JSON.stringify(results) + "\n\n");
+			// this will use too much memory, lets stringify the array in small pieces and write the resulting string
+			var stream = fs.createWriteStream(exportFileName);
+			stream.on('error', console.error);
+			stream.write("{");
+			var first = true;
+			for (var p in results) {
+				if (!first) {
+					stream.write("," + JSON.stringify(results[p]) + "\n");
+					first = false;
+				} else {
+					stream.write(JSON.stringify(results[p]) + "\n");
+				}
+			}
+			stream.write("}\n");
+			stream.end();
+			/*fs.writeFile(exportFileName, table, function(err) {
+			if (err) {
+				return console.log(err);
+			}
+			console.log("wrote data to " + exportFileName);
+			}); */
+			// sortSiteData( "date" );
+		}
+	});
+}
+
+function resolveVariable(vari) {
+	if (dataThisParticipant.length == 0) {
+		console.log("Error: No data from REDCap");
+		return;
+	}
+	if (vari[1] != null) {
+		if (typeof dataThisParticipant[vari[0] + "___" + vari[1]] == 'undefined') {
+			//console.log("ERROR: cannot find the variable \""+ vari[0] + "___" + vari[1] + "\"");
+			return;
+		}
+
+		return dataThisParticipant[vari[0] + "___" + vari[1]];
+	}
+	return dataThisParticipant[vari[0]];
+}
+
+
+// global functions supported by REDCap's branching logic
+var functions = {
+	mean: function (n) {
+		var m = 0;
+		var c = 0;
+		for (i in n) {
+			if (n[i] != "") { // only add values that have a non-string zero value
+				m = m + n[i];
+				c = c + 1;
+			}
+		}
+		if (c > 0) {
+			m = m / c;
+		} else {
+			m = ""; // nothing
+		}
+		return m;
+	},
+	sum: function (n) {
+		var m = 0;
+		var c = 0;
+		for (i in n) {
+			if (n[i] != "") { // only add values that have a non-string zero value
+				m = m + n[i];
+				c = c + 1;
+			}
+		}
+		if (c == 0) {
+			m = ""; // nothing
+		}
+		return m;
+	}
+};
+
+
+// return a score for the string provided to save memory
+var scoreDict = {};
+function s(str) {
+	if (typeof scoreDict[str] == 'undefined') {
+		scoreDict[str] = Object.keys(scoreDict).length;
+	}
+	return scoreDict[str];
+}
+
+var results = [];
+function findProblems(tokens) {
+	// lets ask for one participants data for one instrument and show what that looks like
+	// for example use the 'baseline_visits' instrument
+	if (parser === null) {
+		process.stdout.write("Error: parser did not build");
+		return;
+	}
+
+	// get the data for all participants first
+	var allparts = participants.reduce(function (acc, val) { acc.push(val['id_redcap']); return acc; }, []);
+
+	getParticipantData(allparts, tokens, function (data) {
+		dataThisParticipant = data;
+		var participant = data['id_redcap'];
+		var site = data['redcap_data_access_group'].split("_")[0];
+		var date = data['asnt_timestamp'];
+
+		//console.log('got all data for ' + "NDAR_INV0PRHUTZA");
+		var errors = []; // store variables that produced an error - if they don't exist for example 
+
+		// use the parser to evaluate
+		var str = "";
+		var countGood = 0;
+		var countAll = 0;
+		var parti = { 'instruments': {} };
+		for (var i in instruments) {
+			var instrument = instruments[i];
+			var complete = true;
+			var reason = "is complete"; // why this is not complete
+			var varsInInstrument = {}; // keep a list of all variables in this instrument
+			for (var e in instrument) {
+				//if (!complete)
+				//    break;
+				var visible = true;
+				var entry = instrument[e];
+				if (entry[1] == "") { // don't need to do something if branching logic is empty, always visible, always check if a value exists
+
+					// now in this case we could have a checkbox, any value in any field of the checkbox would count as ok
+					if (entry[2].length > 0) {
+						// now check if any of these variables has a value
+						var foundOne = false;
+						for (var j = 0; j < entry[2].length; j++) {
+							var vname = entry[0] + "___" + entry[2][j];
+							if (typeof data[vname] == 'undefined') {
+								errors.push(vname);
+								continue;
+							}
+							if (data[vname] != "") {
+								foundOne = true;
+								varsInInstrument[vname] = s("no branching logic, at least one checkbox set");
+								break;
+							}
+						}
+						if (!foundOne) {
+							complete = false;
+							reason = " has " + entry[0] + " as an empty entry";
+							varsInInstrument[entry[0]] = s("no branching logic, no checkbox set");
+							continue;
+						}
+					} else {
+						if (typeof data[entry[0]] == 'undefined') {
+							//console.log("Error: tried to pull value for non-existent variable " + entry[0] + ", your REDCap stinks");
+							errors.push(entry[0]);
+							varsInInstrument[entry[0]] = s("no branching logic, value undefined");
+							continue;
+						}
+						if (data[entry[0]] == "") {
+							complete = false;
+							reason = " has " + entry[0] + " as an empty entry";
+							varsInInstrument[entry[0]] = s("no branching logic, no value");
+							continue;
+						}
+						varsInInstrument[entry[0]] = s("no branching logic, value defined");
+						continue;
+					}
+				} else {  // now we have some entries that do have branching logic
+					try {
+						visible = parser.parse(entry[1].trim());
+					} catch (err) {
+						console.log("ERROR in evaluation of: " + entry[1].trim() + "error message: " + err);
+					}
+
+					if (!visible) {
+						if (typeof data[entry[0]] == 'undefined' || data[entry[0]] == "") {
+							varsInInstrument[entry[0]] = s("branching logic hidden, value undefined");
+						} else {
+							varsInInstrument[entry[0]] = s("branching logic hidden, value defined");
+						}
+						continue; // all is well, lets try another one
+					}
+					// ok, if we get here we have branching logic that make this field visible, 
+					// next check if we have a value in this field
+				}
+
+				// branching logic makes this field visible. Do we have a value?
+				if (entry[2].length > 0) { // any of the entries could have a value and we are ok
+					// this is a checkbox field, check all entries
+					var foundOne = false;
+					for (var j = 0; j < entry[2].length; j++) { // check each checkbox value
+						var vname = entry[0] + "___" + entry[2][j];
+						if (typeof data[vname] == 'undefined' || data[vname] == "") {
+							errors.push(vname);
+							varsInInstrument[vname] = s("branching logic shows this, no value for checkbox");
+							continue;
+						}
+						foundOne = true;
+						varsInInstrument[vname] = s("branching logic shows this, at least one checkbox set");
+					}
+					if (!foundOne) {
+						complete = false;
+						reason = " has " + entry[0] + " as an empty entry";
+						varsInInstrument[entry[0]] = s("branching logic shows this, no checkbox set");
+					}
+				} else {
+					if (typeof data[entry[0]] == 'undefined' || data[entry[0]] == "") {
+						//console.log("Error: tried to pull value for non-existent variable " + entry[0] + ", your REDCap stinks");
+						errors.push(entry[0]);
+						varsInInstrument[entry[0]] = s("branching logic shows this, value undefined");
+					} else {
+						 varsInInstrument[entry[0]] = s("branching logic shows this, value defined");
+					}
+				}
+
+			}
+
+			var instrumentLabel = instrumentLabels[i];
+
+			parti['instruments'][i] = varsInInstrument;
+
+			// only count towards completenes if the instrument starts with Y_ or P_
+			if (instrumentLabel.startsWith("Y_") || instrumentLabel.startsWith("P_")) {
+				if (complete) {
+					countGood = countGood + 1;
+				}
+				countAll = countAll + 1;
+			}
+		}
+		var siteScore = ((countAll > 0) ? (countGood / countAll * 100.0).toFixed(0) : "NA");
+		parti['siteScore'] = siteScore;
+		parti['site'] = site;
+		parti['date'] = date;
+		parti['participant'] = participant;
+		results.push(parti);
+	});
+}
+
+let run = (file, options) => {
+	let params = [];
+	if (options.option)
+		params.push('o')
+	if (options.input)
+		params.push('i')
+
+	if (file == "" || typeof file === 'undefined') {
+		console.log("Error: please provide a filename");
+		return;
+	}
+	exportFileName = file;
+
+	// here we do our work
+	//process.stdout.write("hi with these options " + params.join(',') + " - > on " + file + "\n");
+
+	// create the parser
+	var grammar = fs.readFileSync(path.resolve(__dirname, 'grammar.pegjs')).toString();
+	var parserSource = peg.generate(grammar, {
+		cache: true, // $("#option-cache").is(":checked"),
+		optimize: 'speed', // $("#option-optimize").val(),
+		output: "source"
+	});
+	parser = eval(parserSource);
+	// ok parser exists now
+
+	// get tokens options
+	var tokens = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../../code/php/tokens.json'), 'utf8'));
+	//var tokens = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../tokens.json'), 'utf8'));
+	getDataDictionary(tokens);
+	getParticipants(tokens);
+}
+
+console.log("Item masking calculation");
+program
+	.version('0.0.1')
+	.command('create [file]')
+	.option('-o, --option', 'option description')
+	.option('-i, --input [optional]', 'optional user input')
+	.action(run);
+
+program.parse(process.argv); // end with parse to parse through the input
+
+if (program.args.length === 0)
+	program.help();
